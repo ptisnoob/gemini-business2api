@@ -4,12 +4,13 @@ from typing import List, Optional, Union, Dict, Any
 from pathlib import Path
 import logging
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
 import httpx
 import aiofiles
 from fastapi import FastAPI, HTTPException, Header, Request, Body, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from util.streaming_parser import parse_json_array_stream_async
@@ -20,6 +21,7 @@ from core.database import stats_db
 # ---------- 数据目录配置 ----------
 DATA_DIR = "./data"
 logger_prefix = "[LOCAL]"
+PATH_PREFIX = ""  # 路径前缀，用于部署在子路径时
 
 # 确保数据目录存在
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -172,6 +174,36 @@ global_stats = {
 # 任务历史记录（内存存储，容器重启后清空）
 task_history = deque(maxlen=100)  # 最多保留100条历史记录
 task_history_lock = Lock()
+
+# Clash 管理器全局变量
+clash_manager = None
+
+def load_proxy_control() -> dict:
+    """加载代理控制配置"""
+    default = {"master_enabled": False, "auth_enabled": True, "chat_enabled": True, "port": 17890}
+    if not storage.is_database_enabled():
+        return default
+    try:
+        data = storage.load_proxy_control_sync()
+        return data if data else default
+    except Exception:
+        return default
+
+def create_default_clash_config(path: str):
+    """创建默认 Clash 配置文件"""
+    default_config = {
+        "mixed-port": 17890,
+        "mode": "global",
+        "log-level": "silent",
+        "proxies": [],
+        "proxy-groups": [{"name": "GLOBAL", "type": "select", "proxies": ["DIRECT"]}],
+        "rules": ["MATCH,GLOBAL"]
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(default_config, f, allow_unicode=True)
+    except Exception as e:
+        logger.error(f"创建默认 Clash 配置失败: {e}")
 
 
 def get_beijing_time_str(ts: Optional[float] = None) -> str:
@@ -611,7 +643,116 @@ def process_media(data: bytes, mime: str, chat_id: str, file_id: str, base_url: 
         return process_image(data, mime, chat_id, file_id, base_url, idx, request_id, account_id)
 
 # ---------- OpenAI 兼容接口 ----------
-app = FastAPI(title="Gemini-Business OpenAI Gateway")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    # Startup
+    global global_stats
+    global_stats = await load_stats()
+    global_stats.setdefault("request_timestamps", [])
+    global_stats.setdefault("model_request_timestamps", {})
+    global_stats.setdefault("failure_timestamps", [])
+    global_stats.setdefault("rate_limit_timestamps", [])
+    global_stats.setdefault("recent_conversations", [])
+    global_stats.setdefault("success_count", 0)
+    global_stats.setdefault("failed_count", 0)
+    global_stats.setdefault("account_conversations", {})
+    global_stats.setdefault("account_failures", {})
+    uptime_tracker.configure_storage(os.path.join(DATA_DIR, "uptime.json"))
+    uptime_tracker.load_heartbeats()
+    for account_id, account_mgr in multi_account_mgr.accounts.items():
+        account_mgr.conversation_count = global_stats["account_conversations"].get(account_id, 0)
+        account_mgr.failure_count = global_stats["account_failures"].get(account_id, 0)
+    logger.info("[SYSTEM] 已恢复账户成功/失败统计")
+    logger.info(f"[SYSTEM] 统计数据已加载: {global_stats['total_requests']} 次请求, {global_stats['total_visitors']} 位访客")
+    asyncio.create_task(multi_account_mgr.start_background_cleanup())
+    logger.info("[SYSTEM] 后台缓存清理任务已启动（间隔: 5分钟）")
+    asyncio.create_task(cleanup_database_task())
+    logger.info("[SYSTEM] 数据库清理任务已启动（每天清理一次，保留30天数据）")
+    if os.environ.get("ACCOUNTS_CONFIG"):
+        logger.info("[SYSTEM] 自动刷新账号已跳过（使用 ACCOUNTS_CONFIG）")
+    elif storage.is_database_enabled() and AUTO_REFRESH_ACCOUNTS_SECONDS > 0:
+        asyncio.create_task(auto_refresh_accounts_task())
+        logger.info(f"[SYSTEM] 自动刷新账号任务已启动（间隔: {AUTO_REFRESH_ACCOUNTS_SECONDS}秒）")
+    elif storage.is_database_enabled():
+        logger.info("[SYSTEM] 自动刷新账号功能已禁用（配置为0）")
+    if login_service:
+        try:
+            asyncio.create_task(login_service.start_polling())
+            logger.info("[SYSTEM] 账户刷新轮询服务已启动（默认禁用，可在设置中启用）")
+        except Exception as e:
+            logger.error(f"[SYSTEM] 启动登录服务失败: {e}")
+    else:
+        logger.info("[SYSTEM] 自动登录刷新未启用或依赖不可用")
+    if storage.is_database_enabled():
+        asyncio.create_task(save_cooldown_states_task())
+        logger.info("[SYSTEM] 冷却状态定期保存任务已启动（间隔: 5分钟）")
+    asyncio.create_task(cleanup_expired_media_task())
+    expire_hours = config.basic.image_expire_hours
+    if expire_hours < 0:
+        logger.info("[SYSTEM] 媒体文件过期清理已跳过（设置为永不删除）")
+    else:
+        logger.info(f"[SYSTEM] 媒体文件过期清理任务已启动（过期时间: {expire_hours}小时，检查间隔: 30分钟）")
+
+    # 初始化 Clash 代理管理器
+    from core.clash_manager import ClashManager
+    from core import node_manager
+    global clash_manager
+    clash_manager = None
+    proxy_control = load_proxy_control()
+    if proxy_control.get("master_enabled", False):
+        port = proxy_control.get("port", 17890)
+        clash_config_path = "clash_config.yaml"
+
+        # 确保配置文件存在并使用正确端口
+        if not os.path.exists(clash_config_path):
+            create_default_clash_config(clash_config_path)
+
+        # 更新配置文件端口
+        try:
+            with open(clash_config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            cfg["mixed-port"] = port
+            with open(clash_config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, allow_unicode=True)
+        except Exception as e:
+            logger.error(f"[SYSTEM] 更新 Clash 端口失败: {e}")
+
+        # 初始化统计追踪器（无论 Clash 是否启动都需要）
+        stats_tracker = NodeStatsTracker()
+
+        clash_manager = ClashManager(
+            mihomo_path="mihomo.exe",
+            config_path=clash_config_path,
+            mixed_port=port,
+            log_callback=lambda level, msg: logger.info(f"[CLASH] {msg}")
+        )
+        if clash_manager.start():
+            logger.info(f"[SYSTEM] Clash 代理已启动 (端口: {clash_manager.mixed_port})")
+            node_manager.init_clash(clash_manager, stats_tracker)
+        else:
+            logger.warning("[SYSTEM] Clash 启动失败，请检查 mihomo.exe 和配置文件")
+            node_manager.init_clash(None, stats_tracker)
+            clash_manager = None
+    else:
+        logger.info("[SYSTEM] Clash 代理未启用（代理总开关关闭）")
+        stats_tracker = NodeStatsTracker()
+        node_manager.init_clash(None, stats_tracker)
+
+    yield
+
+    # Shutdown
+    if clash_manager:
+        clash_manager.stop()
+        logger.info("[SYSTEM] Clash 代理已停止")
+    if storage.is_database_enabled():
+        try:
+            success_count = await account.save_all_cooldown_states(multi_account_mgr)
+            logger.info(f"[SYSTEM] 应用关闭，已保存 {success_count}/{len(multi_account_mgr.accounts)} 个账户的冷却状态")
+        except Exception as e:
+            logger.error(f"[SYSTEM] 关闭时保存冷却状态失败: {e}")
+
+app = FastAPI(title="Gemini-Business OpenAI Gateway", lifespan=lifespan)
 
 frontend_origin = os.getenv("FRONTEND_ORIGIN", "").strip()
 allow_all_origins = os.getenv("ALLOW_ALL_ORIGINS", "0") == "1"
@@ -756,6 +897,14 @@ async def auto_refresh_accounts_task():
                     global_stats
                 )
 
+                # Fix inconsistent state: accounts that are no longer expired/disabled
+                # and have no quota cooldowns should be marked available
+                for acc_id, acc_mgr in multi_account_mgr.accounts.items():
+                    if not acc_mgr.config.is_expired() and not acc_mgr.config.disabled and not acc_mgr.is_available:
+                        if not acc_mgr.quota_cooldowns:
+                            acc_mgr.is_available = True
+                            logger.info(f"[AUTO-REFRESH] 账号 {acc_id} 状态已修正为可用")
+
                 _last_known_accounts_version = db_version
                 logger.info(f"[AUTO-REFRESH] 账号刷新完成，当前账号数: {len(multi_account_mgr.accounts)}")
 
@@ -765,82 +914,6 @@ async def auto_refresh_accounts_task():
         except Exception as e:
             logger.error(f"[AUTO-REFRESH] 自动刷新任务异常: {type(e).__name__}: {str(e)[:100]}")
             await asyncio.sleep(60)  # 出错后等待60秒再重试
-
-
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时初始化后台任务"""
-    global global_stats
-
-    # 加载统计数据
-    global_stats = await load_stats()
-    global_stats.setdefault("request_timestamps", [])
-    global_stats.setdefault("model_request_timestamps", {})
-    global_stats.setdefault("failure_timestamps", [])
-    global_stats.setdefault("rate_limit_timestamps", [])
-    global_stats.setdefault("recent_conversations", [])
-    global_stats.setdefault("success_count", 0)
-    global_stats.setdefault("failed_count", 0)
-    global_stats.setdefault("account_conversations", {})
-    global_stats.setdefault("account_failures", {})
-    uptime_tracker.configure_storage(os.path.join(DATA_DIR, "uptime.json"))
-    uptime_tracker.load_heartbeats()
-    for account_id, account_mgr in multi_account_mgr.accounts.items():
-        account_mgr.conversation_count = global_stats["account_conversations"].get(account_id, 0)
-        account_mgr.failure_count = global_stats["account_failures"].get(account_id, 0)
-    logger.info("[SYSTEM] 已恢复账户成功/失败统计")
-    logger.info(f"[SYSTEM] 统计数据已加载: {global_stats['total_requests']} 次请求, {global_stats['total_visitors']} 位访客")
-
-    # 启动缓存清理任务
-    asyncio.create_task(multi_account_mgr.start_background_cleanup())
-    logger.info("[SYSTEM] 后台缓存清理任务已启动（间隔: 5分钟）")
-
-    # 启动数据库清理任务
-    asyncio.create_task(cleanup_database_task())
-    logger.info("[SYSTEM] 数据库清理任务已启动（每天清理一次，保留30天数据）")
-
-    # 启动自动刷新账号任务（仅数据库模式有效）
-    if os.environ.get("ACCOUNTS_CONFIG"):
-        logger.info("[SYSTEM] 自动刷新账号已跳过（使用 ACCOUNTS_CONFIG）")
-    elif storage.is_database_enabled() and AUTO_REFRESH_ACCOUNTS_SECONDS > 0:
-        asyncio.create_task(auto_refresh_accounts_task())
-        logger.info(f"[SYSTEM] 自动刷新账号任务已启动（间隔: {AUTO_REFRESH_ACCOUNTS_SECONDS}秒）")
-    elif storage.is_database_enabled():
-        logger.info("[SYSTEM] 自动刷新账号功能已禁用（配置为0）")
-
-    # 启动自动登录刷新轮询（始终启动，但默认禁用）
-    if login_service:
-        try:
-            asyncio.create_task(login_service.start_polling())
-            logger.info("[SYSTEM] 账户刷新轮询服务已启动（默认禁用，可在设置中启用）")
-        except Exception as e:
-            logger.error(f"[SYSTEM] 启动登录服务失败: {e}")
-    else:
-        logger.info("[SYSTEM] 自动登录刷新未启用或依赖不可用")
-
-    # 启动冷却状态定期保存任务（每5分钟保存一次）
-    if storage.is_database_enabled():
-        asyncio.create_task(save_cooldown_states_task())
-        logger.info("[SYSTEM] 冷却状态定期保存任务已启动（间隔: 5分钟）")
-
-    # 启动媒体文件过期清理任务
-    asyncio.create_task(cleanup_expired_media_task())
-    expire_hours = config.basic.image_expire_hours
-    if expire_hours < 0:
-        logger.info("[SYSTEM] 媒体文件过期清理已跳过（设置为永不删除）")
-    else:
-        logger.info(f"[SYSTEM] 媒体文件过期清理任务已启动（过期时间: {expire_hours}小时，检查间隔: 30分钟）")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """应用关闭时保存冷却状态"""
-    if storage.is_database_enabled():
-        try:
-            success_count = await account.save_all_cooldown_states(multi_account_mgr)
-            logger.info(f"[SYSTEM] 应用关闭，已保存 {success_count}/{len(multi_account_mgr.accounts)} 个账户的冷却状态")
-        except Exception as e:
-            logger.error(f"[SYSTEM] 关闭时保存冷却状态失败: {e}")
 
 
 async def save_cooldown_states_task():
@@ -1356,6 +1429,11 @@ async def admin_stats(request: Request, time_range: str = "24h"):
     trend_data = await stats_db.get_stats_by_time_range(time_range)
     success_count, failed_count = await stats_db.get_total_counts()
 
+    # 获取节点统计数据
+    node_stats = {}
+    if node_manager._stats_tracker:
+        node_stats = node_manager._stats_tracker.get_chart_data()
+
     return {
         "total_accounts": total_accounts,
         "active_accounts": active_accounts,
@@ -1364,7 +1442,8 @@ async def admin_stats(request: Request, time_range: str = "24h"):
         "idle_accounts": idle_accounts,
         "success_count": success_count,
         "failed_count": failed_count,
-        "trend": trend_data
+        "trend": trend_data,
+        "node_stats": node_stats
     }
 
 @app.get("/admin/accounts")
@@ -1633,7 +1712,7 @@ async def admin_bulk_disable_accounts(request: Request, account_ids: list[str]):
     return {"status": "success", "success_count": success_count, "errors": errors}
 
 # ---------- Auth endpoints (API) ----------
-@app.get("/admin/settings")
+@app.get("/api/admin/settings")
 @require_login()
 async def admin_get_settings(request: Request):
     """获取系统设置"""
@@ -1665,7 +1744,7 @@ async def admin_get_settings(request: Request):
             "cfmail_verify_ssl": config.basic.cfmail_verify_ssl,
             "cfmail_domain": config.basic.cfmail_domain,
             "browser_engine": config.basic.browser_engine,
-            "browser_headless": config.basic.browser_headless,
+            "browser_mode": config.basic.browser_mode,
             "refresh_window_hours": config.basic.refresh_window_hours,
             "register_default_count": config.basic.register_default_count,
             "register_domain": config.basic.register_domain,
@@ -1708,7 +1787,7 @@ async def admin_get_settings(request: Request):
         }
     }
 
-@app.put("/admin/settings")
+@app.put("/api/admin/settings")
 @require_login()
 async def admin_update_settings(request: Request, new_settings: dict = Body(...)):
     """更新系统设置"""
@@ -1742,7 +1821,7 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         basic.setdefault("cfmail_verify_ssl", config.basic.cfmail_verify_ssl)
         basic.setdefault("cfmail_domain", config.basic.cfmail_domain)
         basic.setdefault("browser_engine", config.basic.browser_engine)
-        basic.setdefault("browser_headless", config.basic.browser_headless)
+        basic.setdefault("browser_mode", config.basic.browser_mode)
         basic.setdefault("refresh_window_hours", config.basic.refresh_window_hours)
         basic.setdefault("register_default_count", config.basic.register_default_count)
         basic.setdefault("register_domain", config.basic.register_domain)
@@ -1782,6 +1861,20 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         quota_limits.setdefault("images_daily_limit", config.quota_limits.images_daily_limit)
         quota_limits.setdefault("videos_daily_limit", config.quota_limits.videos_daily_limit)
         new_settings["quota_limits"] = quota_limits
+
+        # 代理互斥：启用系统代理时自动关闭节点代理
+        proxy_for_auth = basic.get("proxy_for_auth", "").strip()
+        proxy_for_chat = basic.get("proxy_for_chat", "").strip()
+        has_system_proxy = bool(proxy_for_auth or proxy_for_chat)
+
+        if has_system_proxy:
+            proxy_control = load_proxy_control()
+            if proxy_control.get("master_enabled", False):
+                # 自动关闭节点代理
+                proxy_control["master_enabled"] = False
+                proxy_control["auth_enabled"] = False
+                proxy_control["chat_enabled"] = False
+                save_proxy_control(proxy_control)
 
         # 保存旧配置用于对比
         old_proxy_for_auth = PROXY_FOR_AUTH
@@ -1901,6 +1994,155 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
     except Exception as e:
         logger.error(f"[CONFIG] 更新设置失败: {str(e)}")
         raise HTTPException(500, f"更新失败: {str(e)}")
+
+
+# ==================== 节点管理 API ====================
+
+from core import node_manager
+from core.node_stats import NodeStatsTracker
+from core.node_manager import (
+    load_all_nodes, create_node, update_node, delete_node,
+    reset_node_stats, import_from_url_list, import_from_clash_yaml,
+    _invalidate_cache, get_effective_proxy, import_subscription, import_yaml,
+    rotate_node,
+)
+
+
+async def _apply_node_proxy():
+    """节点变更后，重新从节点池选择代理并在需要时重建 HTTP 客户端。"""
+    global PROXY_FOR_AUTH, PROXY_FOR_CHAT, http_client, http_client_chat, http_client_auth
+
+    new_auth = get_effective_proxy("auth", config.basic.proxy_for_auth)
+    new_chat = get_effective_proxy("chat", config.basic.proxy_for_chat)
+
+    if new_auth == PROXY_FOR_AUTH and new_chat == PROXY_FOR_CHAT:
+        return  # 无变化
+
+    old_auth, old_chat = PROXY_FOR_AUTH, PROXY_FOR_CHAT
+    PROXY_FOR_AUTH = new_auth
+    PROXY_FOR_CHAT = new_chat
+
+    await http_client.aclose()
+    await http_client_chat.aclose()
+    await http_client_auth.aclose()
+
+    http_client = httpx.AsyncClient(
+        proxy=(PROXY_FOR_CHAT or None), verify=False, http2=False,
+        timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+        limits=httpx.Limits(max_keepalive_connections=100, max_connections=200)
+    )
+    http_client_chat = httpx.AsyncClient(
+        proxy=(PROXY_FOR_CHAT or None), verify=False, http2=False,
+        timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+        limits=httpx.Limits(max_keepalive_connections=100, max_connections=200)
+    )
+    http_client_auth = httpx.AsyncClient(
+        proxy=(PROXY_FOR_AUTH or None), verify=False, http2=False,
+        timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+        limits=httpx.Limits(max_keepalive_connections=100, max_connections=200)
+    )
+
+    multi_account_mgr.update_http_client(http_client)
+    if register_service:
+        register_service.http_client = http_client_auth
+    if login_service:
+        login_service.http_client = http_client_auth
+
+    logger.info(f"[NODE] 代理已更新: auth={PROXY_FOR_AUTH or '无'}, chat={PROXY_FOR_CHAT or '无'}")
+
+
+@app.get("/admin/nodes")
+@require_login()
+async def admin_list_nodes(request: Request):
+    """列出所有节点"""
+    _invalidate_cache()
+    return {"nodes": load_all_nodes()}
+
+
+@app.post("/admin/nodes")
+@require_login()
+async def admin_create_node(request: Request, body: dict = Body(...)):
+    """新增节点"""
+    name = str(body.get("name", "")).strip()
+    url = str(body.get("url", "")).strip()
+    if not name or not url:
+        raise HTTPException(400, "name 和 url 为必填项")
+    if not url.startswith(("http://", "https://", "socks5://", "socks5h://")):
+        raise HTTPException(400, "url 必须以 http:// https:// socks5:// socks5h:// 开头")
+    node = create_node(
+        name=name, url=url,
+        use_for_auth=bool(body.get("use_for_auth", True)),
+        use_for_chat=bool(body.get("use_for_chat", True)),
+        enabled=bool(body.get("enabled", True)),
+    )
+    await _apply_node_proxy()
+    return node
+
+
+@app.put("/admin/nodes/{node_id}")
+@require_login()
+async def admin_update_node(node_id: str, request: Request, body: dict = Body(...)):
+    """更新节点"""
+    if "url" in body:
+        url = str(body["url"]).strip()
+        if url and not url.startswith(("http://", "https://", "socks5://", "socks5h://")):
+            raise HTTPException(400, "url 格式不正确")
+    node = update_node(node_id, body)
+    if node is None:
+        raise HTTPException(404, "节点不存在")
+    await _apply_node_proxy()
+    return node
+
+
+@app.delete("/admin/nodes/{node_id}")
+@require_login()
+async def admin_delete_node(node_id: str, request: Request):
+    """删除节点"""
+    ok = delete_node(node_id)
+    if not ok:
+        raise HTTPException(404, "节点不存在")
+    await _apply_node_proxy()
+    return {"status": "deleted"}
+
+
+@app.post("/admin/nodes/{node_id}/reset-stats")
+@require_login()
+async def admin_reset_node_stats(node_id: str, request: Request):
+    """重置节点统计"""
+    node = reset_node_stats(node_id)
+    if node is None:
+        raise HTTPException(404, "节点不存在")
+    return node
+
+
+@app.post("/admin/nodes/import/urls")
+@require_login()
+async def admin_import_nodes_from_urls(request: Request, body: dict = Body(...)):
+    """从纯文本 URL 列表批量导入节点"""
+    text = str(body.get("text", ""))
+    use_for_auth = bool(body.get("use_for_auth", True))
+    use_for_chat = bool(body.get("use_for_chat", True))
+    created = import_from_url_list(text, use_for_auth, use_for_chat)
+    if created:
+        await _apply_node_proxy()
+    return {"imported": len(created), "nodes": created}
+
+
+@app.post("/admin/nodes/import/clash")
+@require_login()
+async def admin_import_nodes_from_clash(request: Request, body: dict = Body(...)):
+    """从 Clash proxies YAML 批量导入节点"""
+    yaml_text = str(body.get("yaml", ""))
+    local_proxy_port = int(body.get("local_proxy_port", 17700))
+    use_for_auth = bool(body.get("use_for_auth", True))
+    use_for_chat = bool(body.get("use_for_chat", True))
+    if not yaml_text.strip():
+        raise HTTPException(400, "yaml 内容不能为空")
+    created = import_from_clash_yaml(yaml_text, local_proxy_port, use_for_auth, use_for_chat)
+    if created:
+        await _apply_node_proxy()
+    return {"imported": len(created), "nodes": created}
+
 
 @app.get("/admin/log")
 @require_login()
@@ -3189,7 +3431,171 @@ async def not_found_handler(request: Request, exc: HTTPException):
         content={"detail": "Not Found"}
     )
 
+
+@app.post("/api/admin/nodes/import-subscription")
+@require_login()
+async def import_subscription_endpoint(request: Request, body: dict = Body(...)):
+    """导入订阅链接"""
+    url = str(body.get("url", "")).strip()
+    if not url:
+        raise HTTPException(400, "订阅链接不能为空")
+    count = import_subscription(url)
+    return {"success": True, "count": count}
+
+
+@app.post("/api/admin/nodes/import-yaml")
+@require_login()
+async def import_yaml_endpoint(request: Request, body: dict = Body(...)):
+    """导入 YAML 配置"""
+    content = str(body.get("content", "")).strip()
+    if not content:
+        raise HTTPException(400, "YAML 内容不能为空")
+    count = import_yaml(content)
+    return {"success": True, "count": count}
+
+
+@app.get("/api/admin/nodes/stats")
+@require_login()
+async def get_node_stats_endpoint(request: Request):
+    """获取节点统计"""
+    if node_manager._stats_tracker:
+        return node_manager._stats_tracker.get_stats()
+    return {}
+
+
+@app.post("/api/admin/nodes/rotate")
+@require_login()
+async def rotate_node_endpoint(request: Request):
+    """手动轮询节点"""
+    node_name = rotate_node()
+    return {"success": True, "node": node_name}
+
+
+def save_proxy_control(data: dict):
+    """保存代理控制状态"""
+    import json
+    import os
+    os.makedirs("data", exist_ok=True)
+    control_file = "data/proxy_control.json"
+    with open(control_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+@app.get("/api/admin/proxy-control")
+@require_login()
+async def get_proxy_control(request: Request):
+    """获取代理控制状态"""
+    import json
+    import os
+    control_file = "data/proxy_control.json"
+    if os.path.exists(control_file):
+        try:
+            with open(control_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"master_enabled": False, "auth_enabled": False, "chat_enabled": False}
+
+
+@app.put("/api/admin/proxy-control")
+@require_login()
+async def update_proxy_control(request: Request, body: dict = Body(...)):
+    """更新代理控制状态"""
+    import json
+    import os
+
+    # 代理互斥：启用节点代理时自动清空系统代理
+    master_enabled = body.get("master_enabled", False)
+    if master_enabled:
+        proxy_for_auth = (config.basic.proxy_for_auth or "").strip()
+        proxy_for_chat = (config.basic.proxy_for_chat or "").strip()
+        if proxy_for_auth or proxy_for_chat:
+            # 自动清空系统代理（通过更新配置）
+            config.basic.proxy_for_auth = ""
+            config.basic.proxy_for_chat = ""
+            # 这里不需要保存配置文件，因为前端会处理
+
+    os.makedirs("data", exist_ok=True)
+    control_file = "data/proxy_control.json"
+    try:
+        with open(control_file, "w", encoding="utf-8") as f:
+            json.dump(body, f, ensure_ascii=False, indent=2)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(500, f"保存失败: {e}")
+
+
+@app.get("/api/admin/proxy-config")
+@require_login()
+async def get_proxy_config(request: Request):
+    """预览 Clash YAML 配置"""
+    global clash_manager
+    if clash_manager:
+        content = clash_manager.get_runtime_config()
+        return PlainTextResponse(content if content else "# Clash 配置文件为空")
+
+    # Clash 未启动时，读取配置文件
+    config_path = "clash_config.yaml"
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return PlainTextResponse(f.read())
+        except Exception:
+            pass
+    return PlainTextResponse("# Clash 未启动且配置文件不存在")
+
+
+@app.get("/api/admin/clash/runtime-config")
+@require_login()
+async def get_clash_runtime_config(request: Request):
+    """获取 Clash 运行时配置"""
+    if node_manager._clash_manager:
+        content = node_manager._clash_manager.get_runtime_config()
+        return {"content": content}
+    return {"content": ""}
+
+
+# SPA fallback: 所有非 API 路由返回 index.html
+@app.get("/{full_path:path}")
+async def serve_spa(full_path: str):
+    """处理所有前端路由，返回 index.html"""
+    index_path = os.path.join("static", "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    raise HTTPException(404, "Not Found")
+
+
 if __name__ == "__main__":
     import uvicorn
+    import subprocess
+    import sys
+
     port = int(os.getenv("PORT", "7860"))
+
+    # 检查端口占用并终止进程
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                f'netstat -ano | findstr ":{port}" | findstr "LISTENING"',
+                shell=True, capture_output=True, text=True
+            )
+            if result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        pid = parts[-1]
+                        print(f"端口 {port} 被进程 {pid} 占用，正在终止...")
+                        subprocess.run(f"taskkill /F /PID {pid}", shell=True)
+        else:
+            result = subprocess.run(
+                f"lsof -ti:{port}",
+                shell=True, capture_output=True, text=True
+            )
+            if result.stdout:
+                pid = result.stdout.strip()
+                print(f"端口 {port} 被进程 {pid} 占用，正在终止...")
+                subprocess.run(f"kill -9 {pid}", shell=True)
+    except Exception as e:
+        print(f"检查端口占用时出错: {e}")
+
     uvicorn.run(app, host="0.0.0.0", port=port)

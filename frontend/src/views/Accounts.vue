@@ -40,6 +40,11 @@
             :options="statusOptions"
             class="!w-full sm:!w-40"
           />
+          <SelectMenu
+            v-model="sortBy"
+            :options="sortOptions"
+            class="!w-full sm:!w-44"
+          />
         </div>
         <div class="flex w-full flex-wrap items-center gap-3 text-xs text-muted-foreground sm:w-auto sm:flex-nowrap">
           <Checkbox :modelValue="allSelected" @update:modelValue="toggleSelectAll">
@@ -1242,6 +1247,8 @@ const toast = useToast()
 
 const searchQuery = ref('')
 const statusFilter = ref('all')
+const sortBy = ref(localStorage.getItem('accounts_sort_by') || 'default')
+watch(sortBy, (val) => localStorage.setItem('accounts_sort_by', val))
 const selectedIds = ref<Set<string>>(new Set())
 const viewMode = ref<'table' | 'card'>((localStorage.getItem('accounts_view_mode') as 'table' | 'card') || 'table')
 watch(viewMode, (val) => localStorage.setItem('accounts_view_mode', val))
@@ -1335,13 +1342,58 @@ const statusOptions = [
   { label: '429限流', value: '429限流' },
 ]
 
+const sortOptions = [
+  { label: '默认排序', value: 'default' },
+  { label: '过期时间 ↑', value: 'expires_asc' },
+  { label: '过期时间 ↓', value: 'expires_desc' },
+  { label: '成功率 ↑', value: 'success_rate_asc' },
+  { label: '成功率 ↓', value: 'success_rate_desc' },
+  { label: '对话数 ↑', value: 'conversation_asc' },
+  { label: '对话数 ↓', value: 'conversation_desc' },
+  { label: '错误数 ↑', value: 'error_asc' },
+  { label: '错误数 ↓', value: 'error_desc' },
+]
+
 const filteredAccounts = computed(() => {
   const query = searchQuery.value.trim().toLowerCase()
-  return accounts.value.filter(account => {
+  let filtered = accounts.value.filter(account => {
     const matchesQuery = !query || account.id.toLowerCase().includes(query)
     const matchesStatus = statusFilter.value === 'all' || statusLabel(account) === statusFilter.value
     return matchesQuery && matchesStatus
   })
+
+  // 排序逻辑
+  if (sortBy.value !== 'default') {
+    filtered = [...filtered].sort((a, b) => {
+      const getSuccessRate = (acc: AdminAccount) => {
+        const total = (acc.conversation_count || 0) + (acc.error_count || 0)
+        return total > 0 ? (acc.conversation_count || 0) / total : 0
+      }
+
+      switch (sortBy.value) {
+        case 'expires_asc':
+          return (a.expires_at || '').localeCompare(b.expires_at || '')
+        case 'expires_desc':
+          return (b.expires_at || '').localeCompare(a.expires_at || '')
+        case 'success_rate_asc':
+          return getSuccessRate(a) - getSuccessRate(b)
+        case 'success_rate_desc':
+          return getSuccessRate(b) - getSuccessRate(a)
+        case 'conversation_asc':
+          return (a.conversation_count || 0) - (b.conversation_count || 0)
+        case 'conversation_desc':
+          return (b.conversation_count || 0) - (a.conversation_count || 0)
+        case 'error_asc':
+          return (a.error_count || 0) - (b.error_count || 0)
+        case 'error_desc':
+          return (b.error_count || 0) - (a.error_count || 0)
+        default:
+          return 0
+      }
+    })
+  }
+
+  return filtered
 })
 
 const totalPages = computed(() => Math.ceil(filteredAccounts.value.length / pageSize.value))
@@ -1357,7 +1409,7 @@ const allSelected = computed(() =>
   filteredAccounts.value.length > 0 && filteredAccounts.value.every(account => selectedIds.value.has(account.id))
 )
 
-watch([searchQuery, statusFilter], () => {
+watch([searchQuery, statusFilter, sortBy], () => {
   currentPage.value = 1
 })
 

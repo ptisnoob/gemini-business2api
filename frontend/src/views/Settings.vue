@@ -44,6 +44,24 @@
                   class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
                   placeholder="自动检测或手动填写"
                 />
+
+                <!-- 系统代理总开关 -->
+                <div class="flex items-center justify-between gap-2 mt-3">
+                  <div class="flex items-center gap-2">
+                    <span class="text-xs text-muted-foreground">系统代理总开关</span>
+                    <HelpTip text="启用后可配置账户/聊天代理。与节点代理互斥" />
+                  </div>
+                  <label class="relative inline-flex items-center cursor-pointer">
+                    <input
+                      v-model="systemProxyEnabled"
+                      type="checkbox"
+                      :disabled="nodeProxyEnabled"
+                      class="sr-only peer"
+                    />
+                    <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600 peer-disabled:opacity-50 peer-disabled:cursor-not-allowed"></div>
+                  </label>
+                </div>
+
                 <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                   <span>账户操作代理</span>
                   <HelpTip text="用于注册/登录/刷新操作的代理，留空则禁用" />
@@ -51,6 +69,8 @@
                 <input
                   v-model="localSettings.basic.proxy_for_auth"
                   type="text"
+                  :disabled="!systemProxyEnabled || nodeProxyEnabled"
+                  :class="(!systemProxyEnabled || nodeProxyEnabled) ? 'opacity-50 cursor-not-allowed' : ''"
                   class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
                   placeholder="http://127.0.0.1:7890 | no_proxy=localhost,127.0.0.1"
                 />
@@ -61,9 +81,14 @@
                 <input
                   v-model="localSettings.basic.proxy_for_chat"
                   type="text"
+                  :disabled="!systemProxyEnabled || nodeProxyEnabled"
+                  :class="(!systemProxyEnabled || nodeProxyEnabled) ? 'opacity-50 cursor-not-allowed' : ''"
                   class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
                   placeholder="http://127.0.0.1:7890 | no_proxy=localhost,127.0.0.1"
                 />
+                <div v-if="nodeProxyEnabled" class="mt-2 rounded-2xl bg-amber-500/10 border border-amber-500/20 p-3">
+                  <p class="text-xs text-amber-600 dark:text-amber-400">⚠️ 节点代理已启用，系统代理已自动禁用</p>
+                </div>
               </div>
             </div>
 
@@ -99,12 +124,14 @@
             <div class="rounded-2xl border border-border bg-card p-4">
               <p class="text-xs uppercase tracking-[0.3em] text-muted-foreground">自动注册/刷新</p>
               <div class="mt-4 space-y-3">
-                <div class="flex items-center justify-between gap-2">
-                  <Checkbox v-model="localSettings.basic.browser_headless">
-                    无头浏览器
-                  </Checkbox>
-                  <HelpTip text="无头模式适用于服务器环境（如 Docker）。若注册/刷新失败，建议关闭。" />
+                <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span>浏览器模式</span>
+                  <HelpTip text="正常: 显示窗口；静默: 最小化到任务栏，不抢焦点；无头: 完全无窗口（服务器环境）" />
                 </div>
+                <SelectMenu
+                  v-model="localSettings.basic.browser_mode"
+                  :options="browserModeOptions"
+                />
                 <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                   <span>浏览器引擎</span>
                   <HelpTip text="UC: 支持无头/有头，但可能失败。DP: 支持无头/有头，更稳定，推荐使用。" />
@@ -422,6 +449,56 @@ const toast = useToast()
 const localSettings = ref<Settings | null>(null)
 const isSaving = ref(false)
 const errorMessage = ref('')
+const nodeProxyEnabled = ref(false)
+const systemProxyEnabled = ref(false)
+
+// 检查节点代理状态
+async function checkNodeProxyStatus() {
+  try {
+    const res = await fetch('/api/admin/proxy-control')
+    const data = await res.json()
+    nodeProxyEnabled.value = data.enabled || false
+  } catch (e) {
+    nodeProxyEnabled.value = false
+  }
+}
+
+// 监听系统代理开关
+watch(systemProxyEnabled, async (enabled, oldEnabled) => {
+  if (!localSettings.value || enabled === oldEnabled) return
+
+  if (enabled) {
+    // 启用系统代理时，自动关闭节点代理
+    if (nodeProxyEnabled.value) {
+      try {
+        await fetch('/api/admin/proxy-control', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ master_enabled: false, auth_enabled: false, chat_enabled: false, port: 7890 }),
+        })
+        nodeProxyEnabled.value = false
+        toast.success('系统代理已启用，节点代理已自动关闭')
+      } catch (e) {
+        console.error('关闭节点代理失败:', e)
+      }
+    }
+  } else {
+    // 关闭系统代理时，清空代理配置并保存
+    localSettings.value.basic.proxy_for_auth = ''
+    localSettings.value.basic.proxy_for_chat = ''
+    await handleSave()
+  }
+})
+
+// 监听代理配置变化，自动更新开关状态
+watch(() => localSettings.value?.basic, (basic) => {
+  if (basic) {
+    const hasProxy = !!(basic.proxy_for_auth || basic.proxy_for_chat)
+    if (systemProxyEnabled.value !== hasProxy) {
+      systemProxyEnabled.value = hasProxy
+    }
+  }
+}, { deep: true })
 
 // 429冷却时间：小时 ↔ 秒 的转换
 const DEFAULT_COOLDOWN_HOURS = {
@@ -460,6 +537,11 @@ const videosRateLimitCooldownHours = createCooldownHours(
   DEFAULT_COOLDOWN_HOURS.videos
 )
 
+const browserModeOptions = [
+  { label: '正常 - 显示窗口', value: 'normal' },
+  { label: '静默 - 最小化到任务栏', value: 'silent' },
+  { label: '无头 - 完全无窗口', value: 'headless' },
+]
 const browserEngineOptions = [
   { label: 'DP - 支持无头/有头', value: 'dp' },
 ]
@@ -504,7 +586,7 @@ watch(settings, (value) => {
   next.basic.duckmail_base_url ||= 'https://api.duckmail.sbs'
   next.basic.duckmail_verify_ssl = next.basic.duckmail_verify_ssl ?? true
   next.basic.browser_engine = next.basic.browser_engine || 'dp'
-  next.basic.browser_headless = next.basic.browser_headless ?? false
+  next.basic.browser_mode = next.basic.browser_mode || 'normal'
   next.basic.refresh_window_hours = Number.isFinite(next.basic.refresh_window_hours)
     ? next.basic.refresh_window_hours
     : 1
@@ -572,6 +654,7 @@ watch(settings, (value) => {
 
 onMounted(async () => {
   await settingsStore.loadSettings()
+  await checkNodeProxyStatus()
 })
 
 const handleSave = async () => {

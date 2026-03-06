@@ -881,12 +881,29 @@ def reload_accounts(
             account_mgr = new_mgr.accounts[account_id]
             account_mgr.conversation_count = stats["conversation_count"]
             account_mgr.failure_count = stats.get("failure_count", 0)
-            account_mgr.is_available = stats.get("is_available", True)
             account_mgr.last_error_time = stats.get("last_error_time", 0.0)
             account_mgr.session_usage_count = stats.get("session_usage_count", 0)
-            account_mgr.quota_cooldowns = stats.get("quota_cooldowns", {})
             account_mgr.daily_usage = stats.get("daily_usage", {"text": 0, "images": 0, "videos": 0})
             account_mgr.daily_usage_date = stats.get("daily_usage_date", "")
+
+            # Smart restore: consider new config's expired/disabled state
+            old_available = stats.get("is_available", True)
+            old_cooldowns = stats.get("quota_cooldowns", {})
+            if account_mgr.config.is_expired() or account_mgr.config.disabled:
+                # Still expired/disabled → preserve old state
+                account_mgr.is_available = False
+                account_mgr.quota_cooldowns = old_cooldowns
+            elif not old_available and not old_cooldowns:
+                # Was unavailable with no cooldowns (i.e. expired/disabled),
+                # now recovered → mark available and clear cooldowns
+                account_mgr.is_available = True
+                account_mgr.quota_cooldowns = {}
+                logger.info(f"[CONFIG] Account {account_id} recovered from expired state, cooldowns cleared")
+            else:
+                # Normal case: preserve runtime state (e.g. quota cooldowns)
+                account_mgr.is_available = old_available
+                account_mgr.quota_cooldowns = old_cooldowns
+
             logger.debug(f"[CONFIG] Account {account_id} refreshed; runtime state preserved")
 
     logger.info(

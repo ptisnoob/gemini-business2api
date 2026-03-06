@@ -356,6 +356,11 @@ const menuItems = [
     icon: 'M4 6h10v2H4V6zm12 0h4v2h-4V6zM4 11h6v2H4v-2zm8 0h8v2h-8v-2zM4 16h10v2H4v-2zm12 0h4v2h-4v-2z',
   },
   {
+    path: '/nodes',
+    label: '节点管理',
+    icon: 'M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2zm1 15h-2v-4H7l5-5 5 5h-4v4z',
+  },
+  {
     path: '/monitor',
     label: '监控状态',
     icon: 'M3 12h4l2-4 4 8 3-6h5v2h-4l-4 8-4-8-2 4H3v-2z',

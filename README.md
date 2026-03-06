@@ -45,7 +45,7 @@
 - ✅ 视频生成 - 专用模型，支持 HTML/URL/Markdown 输出格式
 - ✅ 智能文件处理 - 自动识别文件类型，支持 URL 与 Base64
 - ✅ 日志与监控 - 实时状态与统计信息
-- ✅ 代理支持 - 通过设置面板配置
+- ✅ 代理节点管理 - 集成 Clash 代理，支持订阅导入、YAML 配置、节点统计
 - ✅ 内置管理面板 - 在线配置与账号管理
 - ✅ PostgreSQL / SQLite 存储 - 账户/设置/统计持久化
 
@@ -326,7 +326,22 @@ docker-compose up -d
 
 ---
 
-## 🌐 Socks5 免费代理池
+## 🌐 代理配置
+
+### 节点代理（Clash 集成）
+
+项目集成 Clash 代理管理，支持订阅导入、节点统计、自动切换。
+
+**下载 mihomo 内核**（Windows）：
+```bash
+python scripts/download_mihomo.py
+```
+
+或手动下载：[mihomo releases](https://github.com/MetaCubeX/mihomo/releases) → 下载对应平台版本 → 重命名为 `mihomo.exe`（Windows）或 `mihomo`（Linux/macOS）→ 放到项目根目录
+
+**使用方式**：管理面板 → 节点管理 → 导入订阅/YAML → 启用代理总开关
+
+### Socks5 免费代理池
 
 自动注册/刷新账号时可配置代理以提高成功率。推荐使用免费 Socks5 代理池：
 

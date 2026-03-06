@@ -12,6 +12,7 @@ from core.config import config
 from core.mail_providers import create_temp_mail_client
 from core.gemini_automation import GeminiAutomation
 from core.proxy_utils import parse_proxy_setting
+from core import node_manager
 
 logger = logging.getLogger("gemini.register")
 
@@ -204,17 +205,68 @@ class RegisterService(BaseTaskService[RegisterTask]):
             log_cb("error", f"❌ {temp_mail_provider} 邮箱注册失败")
             return {"success": False, "error": f"{temp_mail_provider} 注册失败"}
 
+        if not hasattr(client, 'email') or not client.email:
+            log_cb("error", f"❌ {temp_mail_provider} 邮箱地址未生成")
+            return {"success": False, "error": f"{temp_mail_provider} 邮箱地址未生成"}
+
         log_cb("info", f"✅ 邮箱注册成功: {client.email}")
 
-        headless = config.basic.browser_headless
+        browser_mode = config.basic.browser_mode
         proxy_for_auth, _ = parse_proxy_setting(config.basic.proxy_for_auth)
 
-        log_cb("info", f"🌐 步骤 2/3: 启动浏览器 (无头模式={headless})...")
+        # 节点轮询
+        current_node = None
+        current_node_url = None
+        if node_manager.rotate_node():
+            current_node = node_manager.rotate_node()
+            current_node_url = node_manager.get_current_proxy()
+            if current_node_url:
+                proxy_for_auth = current_node_url
+                log_cb("info", f"🔄 使用节点: {current_node}")
+                log_cb("info", f"📍 代理地址: {current_node_url}")
+
+                # 验证代理连接和节点
+                try:
+                    import httpx
+                    proxies = {"http://": current_node_url, "https://": current_node_url}
+                    with httpx.Client(proxies=proxies, timeout=10) as http_client:
+                        # 测试1: 代理连接
+                        resp = http_client.get("https://www.google.com/generate_204")
+                        if resp.status_code == 204:
+                            log_cb("info", f"✅ 代理连接成功")
+                        else:
+                            log_cb("error", f"❌ 代理验证失败: HTTP {resp.status_code}")
+                            return {"success": False, "error": f"代理验证失败: HTTP {resp.status_code}"}
+
+                        # 测试2: 验证当前 IP（确认节点生效）
+                        try:
+                            ip_resp = http_client.get("https://api.ipify.org?format=json", timeout=5)
+                            if ip_resp.status_code == 200:
+                                proxy_ip = ip_resp.json().get("ip", "未知")
+                                log_cb("info", f"✅ 当前代理 IP: {proxy_ip}")
+                            else:
+                                log_cb("warning", "⚠️ 无法获取代理 IP")
+                        except Exception:
+                            log_cb("warning", "⚠️ IP 验证跳过")
+
+                except httpx.ConnectError as e:
+                    log_cb("error", f"❌ 无法连接到代理: {e}")
+                    log_cb("error", f"⚠️ Clash 可能未启动或端口配置错误")
+                    return {"success": False, "error": f"代理连接失败: {e}"}
+                except Exception as e:
+                    log_cb("error", f"❌ 代理验证异常: {e}")
+                    return {"success": False, "error": f"代理验证异常: {e}"}
+            else:
+                log_cb("warning", "⚠️ 节点轮询返回空代理地址")
+        else:
+            log_cb("info", "ℹ️ 未启用节点代理，使用配置文件中的代理设置")
+
+        log_cb("info", f"🌐 步骤 2/3: 启动浏览器 (模式={browser_mode})...")
 
         automation = GeminiAutomation(
             user_agent=self.user_agent,
             proxy=proxy_for_auth,
-            headless=headless,
+            browser_mode=browser_mode,
             log_callback=log_cb,
         )
         # 允许外部取消时立刻关闭浏览器
@@ -225,12 +277,22 @@ class RegisterService(BaseTaskService[RegisterTask]):
             result = automation.login_and_extract(client.email, client, is_new_account=True)
         except Exception as exc:
             log_cb("error", f"❌ 自动登录异常: {exc}")
+            if current_node and node_manager._stats_tracker:
+                node_manager._stats_tracker.record(current_node, "other")
             return {"success": False, "error": str(exc)}
 
         if not result.get("success"):
             error = result.get("error", "自动化流程失败")
             log_cb("error", f"❌ 自动登录失败: {error}")
+            if current_node and node_manager._stats_tracker:
+                if "403" in error or "banned" in error.lower() or "risk" in error.lower():
+                    node_manager._stats_tracker.record(current_node, "risk_control")
+                else:
+                    node_manager._stats_tracker.record(current_node, "other")
             return {"success": False, "error": error}
+
+        if current_node and node_manager._stats_tracker:
+            node_manager._stats_tracker.record(current_node, "success")
 
         log_cb("info", "✅ Gemini 登录成功，正在保存配置...")
 

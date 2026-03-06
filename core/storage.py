@@ -295,6 +295,14 @@ async def _init_tables(pool) -> None:
             ON task_history(created_at DESC)
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_control (
+                id INTEGER PRIMARY KEY,
+                data JSONB NOT NULL
+            )
+            """
+        )
         logger.info("[STORAGE] Database tables initialized")
 
 def _init_sqlite_tables(conn: sqlite3.Connection) -> None:
@@ -347,6 +355,14 @@ def _init_sqlite_tables(conn: sqlite3.Connection) -> None:
             """
             CREATE INDEX IF NOT EXISTS task_history_created_at_idx
             ON task_history(created_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_control (
+                id INTEGER PRIMARY KEY,
+                data TEXT NOT NULL
+            )
             """
         )
         conn.execute(
@@ -981,6 +997,44 @@ def save_settings_sync(settings: dict) -> bool:
     return _run_in_db_loop(save_settings(settings))
 
 
+# ==================== Nodes storage ====================
+
+async def load_nodes() -> Optional[list]:
+    if not is_database_enabled():
+        return None
+    try:
+        data = await _load_kv("kv_settings", "nodes")
+        if data is None:
+            return []
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        logger.error(f"[STORAGE] Nodes read failed: {e}")
+    return None
+
+
+async def save_nodes(nodes: list) -> bool:
+    if not is_database_enabled():
+        return False
+    try:
+        saved = await _save_kv("kv_settings", "nodes", nodes)
+        if saved:
+            logger.info(f"[STORAGE] Saved {len(nodes)} nodes to database")
+        return saved
+    except Exception as e:
+        logger.error(f"[STORAGE] Nodes write failed: {e}")
+    return False
+
+
+def load_nodes_sync() -> Optional[list]:
+    return _run_in_db_loop(load_nodes())
+
+
+def save_nodes_sync(nodes: list) -> bool:
+    return _run_in_db_loop(save_nodes(nodes))
+
+
 def load_stats_sync() -> Optional[dict]:
     return _run_in_db_loop(load_stats())
 
@@ -1125,3 +1179,58 @@ def load_task_history_sync(limit: int = 100) -> Optional[list]:
 
 def clear_task_history_sync() -> int:
     return _run_in_db_loop(clear_task_history())
+
+
+# ---------- 代理控制配置 ----------
+
+async def save_proxy_control(data: dict) -> bool:
+    """保存代理控制配置"""
+    if not is_database_enabled():
+        return False
+    backend = _get_backend()
+    try:
+        json_data = json.dumps(data)
+        if backend == "postgres":
+            async with _pg_acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO proxy_control (id, data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET data = $1",
+                    json_data
+                )
+            return True
+        if backend == "sqlite":
+            conn = _get_sqlite_conn()
+            with _sqlite_lock, conn:
+                conn.execute("INSERT OR REPLACE INTO proxy_control (id, data) VALUES (1, ?)", (json_data,))
+            return True
+    except Exception as e:
+        logger.error(f"[STORAGE] Save proxy control failed: {e}")
+    return False
+
+
+async def load_proxy_control() -> Optional[dict]:
+    """加载代理控制配置"""
+    if not is_database_enabled():
+        return None
+    backend = _get_backend()
+    try:
+        if backend == "postgres":
+            async with _pg_acquire() as conn:
+                row = await conn.fetchrow("SELECT data FROM proxy_control WHERE id = 1")
+            return json.loads(row["data"]) if row else None
+        if backend == "sqlite":
+            conn = _get_sqlite_conn()
+            with _sqlite_lock:
+                cur = conn.execute("SELECT data FROM proxy_control WHERE id = 1")
+                row = cur.fetchone()
+            return json.loads(row[0]) if row else None
+    except Exception as e:
+        logger.error(f"[STORAGE] Load proxy control failed: {e}")
+    return None
+
+
+def save_proxy_control_sync(data: dict) -> bool:
+    return _run_in_db_loop(save_proxy_control(data))
+
+
+def load_proxy_control_sync() -> Optional[dict]:
+    return _run_in_db_loop(load_proxy_control())

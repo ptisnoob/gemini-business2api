@@ -14,6 +14,7 @@ from core.mail_providers import create_temp_mail_client
 from core.gemini_automation import GeminiAutomation
 from core.microsoft_mail_client import MicrosoftMailClient
 from core.proxy_utils import parse_proxy_setting
+from core import node_manager
 
 logger = logging.getLogger("gemini.login")
 
@@ -276,20 +277,21 @@ class LoginService(BaseTaskService[LoginTask]):
         else:
             return {"success": False, "email": account_id, "error": f"不支持的邮件提供商: {mail_provider}"}
 
-        headless = config.basic.browser_headless
+        browser_mode = config.basic.browser_mode
 
-        # 持久化浏览器配置：每个账号一个独立的 user-data-dir
-        sanitized = account_id.replace("@", "_at_").replace(".", "_")
-        profile_dir = os.path.join("data", "browser_profiles", sanitized)
+        # 节点轮询
+        current_node = node_manager.rotate_node()
+        if current_node:
+            proxy_for_auth = node_manager.get_current_proxy()
+            log_cb("info", f"🔄 切换节点: {current_node}")
 
-        log_cb("info", f"🌐 启动浏览器 (无头模式={headless})...")
+        log_cb("info", f"🌐 启动浏览器 (模式={browser_mode})...")
 
         automation = GeminiAutomation(
             user_agent=self.user_agent,
             proxy=proxy_for_auth,
-            headless=headless,
+            browser_mode=browser_mode,
             log_callback=log_cb,
-            profile_dir=profile_dir,
         )
         # 允许外部取消时立刻关闭浏览器
         self._add_cancel_hook(task.id, lambda: getattr(automation, "stop", lambda: None)())
@@ -298,11 +300,21 @@ class LoginService(BaseTaskService[LoginTask]):
             result = automation.login_and_extract(account_id, client)
         except Exception as exc:
             log_cb("error", f"❌ 自动登录异常: {exc}")
+            if current_node and node_manager._stats_tracker:
+                node_manager._stats_tracker.record(current_node, "other")
             return {"success": False, "email": account_id, "error": str(exc)}
         if not result.get("success"):
             error = result.get("error", "自动化流程失败")
             log_cb("error", f"❌ 自动登录失败: {error}")
+            if current_node and node_manager._stats_tracker:
+                if "403" in error or "banned" in error.lower() or "risk" in error.lower():
+                    node_manager._stats_tracker.record(current_node, "risk_control")
+                else:
+                    node_manager._stats_tracker.record(current_node, "other")
             return {"success": False, "email": account_id, "error": error}
+
+        if current_node and node_manager._stats_tracker:
+            node_manager._stats_tracker.record(current_node, "success")
 
         log_cb("info", "✅ Gemini 登录成功，正在保存配置...")
 

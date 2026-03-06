@@ -46,8 +46,9 @@ class BasicConfig(BaseModel):
     """基础配置"""
     api_key: str = Field(default="", description="API访问密钥（留空则公开访问，多个密钥用逗号分隔）")
     base_url: str = Field(default="", description="服务器URL（留空则自动检测）")
-    proxy_for_auth: str = Field(default="", description="账户操作代理地址（注册/登录/刷新，留空则不使用代理）")
-    proxy_for_chat: str = Field(default="", description="对话操作代理地址（JWT/会话/消息，留空则不使用代理）")
+    # DEPRECATED: 代理配置已迁移到节点管理页面的代理控制面板
+    proxy_for_auth: str = Field(default="", description="[已弃用] 账户操作代理地址，请使用节点管理页面配置")
+    proxy_for_chat: str = Field(default="", description="[已弃用] 对话操作代理地址，请使用节点管理页面配置")
     duckmail_base_url: str = Field(default="https://api.duckmail.sbs", description="DuckMail API地址")
     duckmail_api_key: str = Field(default="", description="DuckMail API key")
     duckmail_verify_ssl: bool = Field(default=True, description="DuckMail SSL校验")
@@ -69,7 +70,7 @@ class BasicConfig(BaseModel):
     cfmail_verify_ssl: bool = Field(default=True, description="Cloudflare Mail SSL校验")
     cfmail_domain: str = Field(default="", description="Cloudflare Mail 邮箱域名（可选，留空随机）")
     browser_engine: str = Field(default="dp", description="浏览器引擎")
-    browser_headless: bool = Field(default=False, description="自动化浏览器无头模式")
+    browser_mode: str = Field(default="normal", description="浏览器模式: normal(正常) / silent(静默最小化) / headless(无头)")
     refresh_window_hours: int = Field(default=1, ge=0, le=24, description="过期刷新窗口（小时）")
     register_default_count: int = Field(default=1, ge=1, description="默认注册数量")
     register_domain: str = Field(default="", description="DuckMail 域名（推荐）")
@@ -213,6 +214,14 @@ class ConfigManager:
             if isinstance(old_proxy_for_chat_bool, bool) and old_proxy_for_chat_bool:
                 proxy_for_chat = old_proxy
 
+        # 处理浏览器模式（向后兼容旧的 browser_headless）
+        browser_mode = basic_data.get("browser_mode")
+        if not browser_mode:
+            old_headless = _parse_bool(basic_data.get("browser_headless"), False)
+            browser_mode = "headless" if old_headless else "normal"
+        if browser_mode not in ("normal", "silent", "headless"):
+            browser_mode = "normal"
+
         basic_config = BasicConfig(
             api_key=basic_data.get("api_key") or "",
             base_url=basic_data.get("base_url") or "",
@@ -239,7 +248,7 @@ class ConfigManager:
             cfmail_verify_ssl=_parse_bool(basic_data.get("cfmail_verify_ssl"), True),
             cfmail_domain=str(basic_data.get("cfmail_domain") or "").strip(),
             browser_engine=basic_data.get("browser_engine") or "dp",
-            browser_headless=_parse_bool(basic_data.get("browser_headless"), False),
+            browser_mode=browser_mode,
             refresh_window_hours=int(refresh_window_raw),
             register_default_count=int(register_default_raw),
             register_domain=str(register_domain_raw or "").strip(),
